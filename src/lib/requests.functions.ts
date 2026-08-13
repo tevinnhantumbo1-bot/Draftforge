@@ -1,6 +1,23 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { z } from "zod";
+import {
+  createDraftRequestMongo,
+  getDraftRequestMongo,
+  listDraftRequestsMongo,
+  updateDraftRequestMongo,
+  deleteDraftRequestMongo,
+  getDashboardStatsMongo,
+  type DraftRequestDoc,
+} from "./drafts.service";
+import {
+  generateLegalContractDraft,
+  analyzeLegalRisk,
+  chatWithAiAssistant,
+  expandClauseWithAi,
+  summarizeLegalDocWithAi,
+} from "./gemini";
+import { recordUserActivity } from "./user.service";
 
 const BUCKET = "design-previews";
 
@@ -10,22 +27,16 @@ export const getDailyFreeUsage = createServerFn({ method: "GET" })
     z.object({ activePlan: z.string().optional() }).optional().parse(input),
   )
   .handler(async ({ data, context }) => {
+    const requests = await listDraftRequestsMongo(context.userId);
     const startOfDay = new Date();
     startOfDay.setUTCHours(0, 0, 0, 0);
 
-    const { count, error } = await context.supabase
-      .from("design_requests")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", context.userId)
-      .gte("created_at", startOfDay.toISOString());
+    const usedToday = requests.filter(
+      (r) => new Date(r.created_at).getTime() >= startOfDay.getTime(),
+    ).length;
 
-    if (error) {
-      console.warn("Could not query daily request count:", error);
-    }
-
-    const usedToday = count ?? 0;
     const plan = data?.activePlan || "free";
-    
+
     let maxFreePerDay = 2;
     if (plan === "weekly_boost") maxFreePerDay = 5;
     else if (plan === "pro") maxFreePerDay = 50;
@@ -51,6 +62,9 @@ const CreateInput = z.object({
   style: z.string().trim().max(200).optional().nullable(),
   package: z.enum(["concept", "standard", "pro"]),
   activePlan: z.string().optional(),
+  jurisdiction: z.string().optional(),
+  urgency: z.string().optional(),
+  keyTerms: z.array(z.string()).optional(),
 });
 
 export const createRequest = createServerFn({ method: "POST" })
@@ -59,17 +73,14 @@ export const createRequest = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { quoteCents } = await import("@/lib/pricing");
 
-    // Calculate daily request usage
+    const requests = await listDraftRequestsMongo(context.userId);
     const startOfDay = new Date();
     startOfDay.setUTCHours(0, 0, 0, 0);
 
-    const { count } = await context.supabase
-      .from("design_requests")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", context.userId)
-      .gte("created_at", startOfDay.toISOString());
+    const usedToday = requests.filter(
+      (r) => new Date(r.created_at).getTime() >= startOfDay.getTime(),
+    ).length;
 
-    const usedToday = count ?? 0;
     const plan = data.activePlan || "free";
 
     let maxFreePerDay = 2;
@@ -78,13 +89,34 @@ export const createRequest = createServerFn({ method: "POST" })
     else if (plan === "studio") maxFreePerDay = 9999;
 
     const isFreeTest = usedToday < maxFreePerDay;
-
-    // For free test / subscription quota, quote_cents is 0
     const quote = isFreeTest ? 0 : quoteCents(data.package, data.category, data.brief.length);
 
-    const { data: row, error } = await context.supabase
-      .from("design_requests")
-      .insert({
+    const requestId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    const doc: DraftRequestDoc = {
+      id: requestId,
+      title: data.title,
+      document_type: data.category || "Legal Contract",
+      category: data.category,
+      jurisdiction: data.jurisdiction || "US-CA",
+      urgency: data.urgency || "standard",
+      description: data.brief,
+      key_terms: data.keyTerms || [],
+      attached_files: [],
+      status: isFreeTest ? "submitted" : "draft",
+      price_usd: quote / 100,
+      user_address: context.userId.toLowerCase(),
+      created_at: now,
+      updated_at: now,
+    };
+
+    await createDraftRequestMongo(doc);
+
+    // Also write to Supabase for backward compatibility if configured
+    try {
+      await context.supabase.from("design_requests").insert({
+        id: requestId,
         user_id: context.userId,
         title: data.title,
         brief: data.brief,
@@ -95,12 +127,13 @@ export const createRequest = createServerFn({ method: "POST" })
         package: data.package,
         status: isFreeTest ? "free_test" : "submitted",
         quote_cents: quote,
-      })
-      .select("id")
-      .single();
-    if (error) throw new Error(error.message);
+      });
+    } catch {
+      /* fallback mode */
+    }
+
     return {
-      id: row.id as string,
+      id: requestId,
       isFreeTest,
       usedToday: usedToday + 1,
       maxFreePerDay,
@@ -111,13 +144,33 @@ export const createRequest = createServerFn({ method: "POST" })
 export const listMyRequests = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
-    const { data, error } = await context.supabase
-      .from("design_requests")
-      .select("id,title,category,status,quote_cents,paid,created_at,package")
-      .order("created_at", { ascending: false });
-    if (error) throw new Error(error.message);
-    return data ?? [];
+    const mongoRequests = await listDraftRequestsMongo(context.userId);
+    if (mongoRequests && mongoRequests.length > 0) {
+      return mongoRequests.map((r) => ({
+        id: r.id,
+        title: r.title,
+        category: r.category || r.document_type,
+        status: r.status,
+        quote_cents: Math.round(r.price_usd * 100),
+        paid: r.status === "paid" || !!r.base_payment_tx,
+        created_at: r.created_at,
+        package: "standard",
+      }));
+    }
+
+    try {
+      const { data, error } = await context.supabase
+        .from("design_requests")
+        .select("id,title,category,status,quote_cents,paid,created_at,package")
+        .order("created_at", { ascending: false });
+      if (!error && data) return data;
+    } catch {
+      /* fallback */
+    }
+
+    return [];
   });
+
 
 const UploadInput = z.object({
   id: z.string().uuid(),
@@ -208,6 +261,26 @@ export const getRequest = createServerFn({ method: "POST" })
     z.object({ id: z.string().uuid() }).parse(input),
   )
   .handler(async ({ data, context }) => {
+    const mongoReq = await getDraftRequestMongo(data.id);
+    if (mongoReq) {
+      return {
+        request: {
+          id: mongoReq.id,
+          title: mongoReq.title,
+          brief: mongoReq.description,
+          category: mongoReq.category || mongoReq.document_type,
+          status: mongoReq.status,
+          quote_cents: Math.round(mongoReq.price_usd * 100),
+          paid: mongoReq.status === "paid" || !!mongoReq.base_payment_tx,
+          created_at: mongoReq.created_at,
+          draft_output: mongoReq.draft_output,
+          ai_analysis: mongoReq.ai_analysis,
+          jurisdiction: mongoReq.jurisdiction,
+        },
+        assets: [],
+      };
+    }
+
     const { data: request, error } = await context.supabase
       .from("design_requests")
       .select("*")
@@ -234,6 +307,7 @@ export const getRequest = createServerFn({ method: "POST" })
     );
     return { request, assets: withUrls };
   });
+
 
 export const generatePreviewImages = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])

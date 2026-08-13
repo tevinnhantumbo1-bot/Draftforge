@@ -1,0 +1,1 @@
+import{b as e}from"./index-DaNPgw47.js";var t=e({type:`function`});export{t};
