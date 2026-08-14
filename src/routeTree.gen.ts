@@ -12,8 +12,10 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
 import { Route as AuthRouteImport } from './routes/auth'
+import { Route as SubscriptionRouteImport } from './routes/subscription'
 import { Route as AuthenticatedDashboardRouteImport } from './routes/_authenticated/dashboard'
 import { Route as AuthenticatedNewRouteImport } from './routes/_authenticated/new'
+import { Route as AuthenticatedWorkspaceRouteImport } from './routes/_authenticated/workspace'
 import { Route as AuthenticatedRequestsIdRouteImport } from './routes/_authenticated/requests.$id'
 
 const IndexRoute = IndexRouteImport.update({
@@ -30,6 +32,11 @@ const AuthRoute = AuthRouteImport.update({
   path: '/auth',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SubscriptionRoute = SubscriptionRouteImport.update({
+  id: '/subscription',
+  path: '/subscription',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AuthenticatedDashboardRoute = AuthenticatedDashboardRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
@@ -38,6 +45,11 @@ const AuthenticatedDashboardRoute = AuthenticatedDashboardRouteImport.update({
 const AuthenticatedNewRoute = AuthenticatedNewRouteImport.update({
   id: '/new',
   path: '/new',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+const AuthenticatedWorkspaceRoute = AuthenticatedWorkspaceRouteImport.update({
+  id: '/workspace',
+  path: '/workspace',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
 const AuthenticatedRequestsIdRoute = AuthenticatedRequestsIdRouteImport.update({
@@ -49,15 +61,19 @@ const AuthenticatedRequestsIdRoute = AuthenticatedRequestsIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/auth': typeof AuthRoute
+  '/subscription': typeof SubscriptionRoute
   '/dashboard': typeof AuthenticatedDashboardRoute
   '/new': typeof AuthenticatedNewRoute
+  '/workspace': typeof AuthenticatedWorkspaceRoute
   '/requests/$id': typeof AuthenticatedRequestsIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/auth': typeof AuthRoute
+  '/subscription': typeof SubscriptionRoute
   '/dashboard': typeof AuthenticatedDashboardRoute
   '/new': typeof AuthenticatedNewRoute
+  '/workspace': typeof AuthenticatedWorkspaceRoute
   '/requests/$id': typeof AuthenticatedRequestsIdRoute
 }
 export interface FileRoutesById {
@@ -65,22 +81,40 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
   '/auth': typeof AuthRoute
+  '/subscription': typeof SubscriptionRoute
   '/_authenticated/dashboard': typeof AuthenticatedDashboardRoute
   '/_authenticated/new': typeof AuthenticatedNewRoute
+  '/_authenticated/workspace': typeof AuthenticatedWorkspaceRoute
   '/_authenticated/requests/$id': typeof AuthenticatedRequestsIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/auth' | '/dashboard' | '/new' | '/requests/$id'
+  fullPaths:
+    | '/'
+    | '/auth'
+    | '/subscription'
+    | '/dashboard'
+    | '/new'
+    | '/workspace'
+    | '/requests/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/auth' | '/dashboard' | '/new' | '/requests/$id'
+  to:
+    | '/'
+    | '/auth'
+    | '/subscription'
+    | '/dashboard'
+    | '/new'
+    | '/workspace'
+    | '/requests/$id'
   id:
     | '__root__'
     | '/'
     | '/_authenticated'
     | '/auth'
+    | '/subscription'
     | '/_authenticated/dashboard'
     | '/_authenticated/new'
+    | '/_authenticated/workspace'
     | '/_authenticated/requests/$id'
   fileRoutesById: FileRoutesById
 }
@@ -88,6 +122,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthenticatedRouteRoute: typeof AuthenticatedRouteRouteWithChildren
   AuthRoute: typeof AuthRoute
+  SubscriptionRoute: typeof SubscriptionRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -113,6 +148,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/subscription': {
+      id: '/subscription'
+      path: '/subscription'
+      fullPath: '/subscription'
+      preLoaderRoute: typeof SubscriptionRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_authenticated/dashboard': {
       id: '/_authenticated/dashboard'
       path: '/dashboard'
@@ -125,6 +167,13 @@ declare module '@tanstack/react-router' {
       path: '/new'
       fullPath: '/new'
       preLoaderRoute: typeof AuthenticatedNewRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/workspace': {
+      id: '/_authenticated/workspace'
+      path: '/workspace'
+      fullPath: '/workspace'
+      preLoaderRoute: typeof AuthenticatedWorkspaceRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/requests/$id': {
@@ -140,12 +189,14 @@ declare module '@tanstack/react-router' {
 interface AuthenticatedRouteRouteChildren {
   AuthenticatedDashboardRoute: typeof AuthenticatedDashboardRoute
   AuthenticatedNewRoute: typeof AuthenticatedNewRoute
+  AuthenticatedWorkspaceRoute: typeof AuthenticatedWorkspaceRoute
   AuthenticatedRequestsIdRoute: typeof AuthenticatedRequestsIdRoute
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedDashboardRoute: AuthenticatedDashboardRoute,
   AuthenticatedNewRoute: AuthenticatedNewRoute,
+  AuthenticatedWorkspaceRoute: AuthenticatedWorkspaceRoute,
   AuthenticatedRequestsIdRoute: AuthenticatedRequestsIdRoute,
 }
 
@@ -156,6 +207,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthenticatedRouteRoute: AuthenticatedRouteRouteWithChildren,
   AuthRoute: AuthRoute,
+  SubscriptionRoute: SubscriptionRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
