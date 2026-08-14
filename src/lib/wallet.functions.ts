@@ -6,6 +6,8 @@ import {
   getUserProfileByAddress,
   getUserActivityLogs,
 } from "./user.service";
+import { createSessionToken } from "./auth.service";
+import { connectToDatabase } from "./mongodb";
 
 const Address = z
   .string()
@@ -18,15 +20,21 @@ export const getWalletNonce = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const nonce = crypto.randomUUID().replace(/-/g, "");
     const issuedAt = new Date().toISOString();
-    try {
-      const { supabaseAdmin } =
-        await import("@/integrations/supabase/client.server");
-      await supabaseAdmin
-        .from("wallet_nonces")
-        .insert({ nonce, address: data.address.toLowerCase() });
-    } catch {
-      /* fallback to standalone mode */
+
+    const { db } = await connectToDatabase();
+    if (db) {
+      try {
+        await db.collection("wallet_nonces").insertOne({
+          nonce,
+          address: data.address.toLowerCase(),
+          created_at: issuedAt,
+          expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        });
+      } catch (err) {
+        console.error("[MongoDB Nonce Error]", err);
+      }
     }
+
     return { nonce, issuedAt };
   });
 
@@ -88,7 +96,7 @@ export const verifyWalletLogin = createServerFn({ method: "POST" })
     // 2. Record authentication activity log in MongoDB
     await recordUserActivity({
       userAddress: address,
-      action: "user_login",
+      action: "user_login_wallet",
       details: {
         provider: data.provider,
         login_at: new Date().toISOString(),
@@ -97,22 +105,27 @@ export const verifyWalletLogin = createServerFn({ method: "POST" })
       location: data.locationData,
     });
 
-    try {
-      const { supabaseAdmin } =
-        await import("@/integrations/supabase/client.server");
+    // 3. Generate native signed MongoDB session token
+    const token = createSessionToken({
+      userId: address,
+      email,
+      address,
+      name: `Wallet ${address.slice(0, 6)}…${address.slice(-4)}`,
+      provider: data.provider,
+    });
 
-      const link = await supabaseAdmin.auth.admin.generateLink({
-        type: "magiclink",
+    return {
+      email,
+      token,
+      profile: userProfile,
+      user: {
+        id: address,
         email,
-      });
-      if (link.data?.properties?.hashed_token) {
-        return { email, tokenHash: link.data.properties.hashed_token, profile: userProfile };
-      }
-    } catch {
-      /* fallback to standalone mode */
-    }
-
-    return { email, tokenHash: "mock-wallet-token-hash", profile: userProfile };
+        address,
+        provider: data.provider,
+        name: `Wallet ${address.slice(0, 6)}…${address.slice(-4)}`,
+      },
+    };
   });
 
 export const fetchUserProfile = createServerFn({ method: "GET" })
@@ -122,4 +135,3 @@ export const fetchUserProfile = createServerFn({ method: "GET" })
     const logs = await getUserActivityLogs(address);
     return { profile, activityLogs: logs };
   });
-

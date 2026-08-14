@@ -1,6 +1,15 @@
 import { connectToDatabase } from "./mongodb";
 import { recordUserActivity } from "./user.service";
 
+export interface DraftAsset {
+  id: string;
+  kind: "image" | "video" | "reference";
+  url: string;
+  prompt?: string;
+  signedUrl?: string | null;
+  created_at: string;
+}
+
 export interface DraftRequestDoc {
   id: string;
   title: string;
@@ -14,6 +23,11 @@ export interface DraftRequestDoc {
   governing_law?: string | null;
   special_instructions?: string | null;
   attached_files: { name: string; url: string; size?: number }[];
+  assets?: DraftAsset[];
+  dimensions?: string | null;
+  units?: string;
+  style?: string | null;
+  package?: string;
   status:
     | "draft"
     | "submitted"
@@ -25,6 +39,10 @@ export interface DraftRequestDoc {
     | "cancelled";
   price_usd: number;
   base_payment_tx?: string | null;
+  payment_id?: string | null;
+  payer_address?: string | null;
+  payment_network?: string | null;
+  paid_amount_usdc?: number | null;
   user_address?: string | null;
   draft_output?: string | null;
   ai_analysis?: {
@@ -38,6 +56,37 @@ export interface DraftRequestDoc {
 }
 
 const memoryDrafts = new Map<string, DraftRequestDoc>();
+
+/**
+ * Adds an asset (preview image, motion video, reference) to a draft request in MongoDB.
+ */
+export async function addAssetToDraftMongo(
+  requestId: string,
+  asset: DraftAsset,
+): Promise<void> {
+  const { db } = await connectToDatabase();
+  if (db) {
+    try {
+      await db.collection("draft_requests").updateOne(
+        { id: requestId },
+        {
+          $push: { assets: asset } as unknown as Record<string, unknown>,
+          $set: { updated_at: new Date().toISOString() },
+        },
+      );
+      return;
+    } catch (err) {
+      console.error("[MongoDB addAssetToDraftMongo Error]", err);
+    }
+  }
+
+  const existing = memoryDrafts.get(requestId);
+  if (existing) {
+    existing.assets = [...(existing.assets || []), asset];
+    existing.updated_at = new Date().toISOString();
+  }
+}
+
 
 /**
  * Creates a new draft request document in MongoDB.

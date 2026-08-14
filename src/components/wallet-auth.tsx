@@ -4,7 +4,6 @@ import { useServerFn } from "@tanstack/react-start";
 import { toast } from "sonner";
 import { Wallet } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { supabase } from "@/integrations/supabase/client";
 import { getWalletNonce, verifyWalletLogin } from "@/lib/wallet.functions";
 import { buildSiweMessage, BASE_SEPOLIA_CHAIN_ID } from "@/lib/siwe";
 
@@ -48,27 +47,35 @@ export function WalletAuthButtons({
     signature: string;
     provider: "base" | "metamask";
   }) {
+    let token: string | undefined;
+    let userObj = {
+      address: payload.address.toLowerCase(),
+      email: `${payload.address.slice(0, 6)}…${payload.address.slice(-4)}@wallet.draftforge.app`,
+      full_name: `Wallet ${payload.address.slice(0, 6)}…${payload.address.slice(-4)}`,
+    };
+
     try {
       const res = await verifyFn({ data: payload });
-      if (res?.tokenHash && res.tokenHash !== "mock-wallet-token-hash") {
-        await supabase.auth.verifyOtp({
-          type: "email",
-          token_hash: res.tokenHash,
-        });
+      if (res?.token) {
+        token = res.token;
       }
-    } catch {
-      /* ignore Supabase auth verify in standalone mode */
+      if (res?.user) {
+        userObj = {
+          address: res.user.address?.toLowerCase() || payload.address.toLowerCase(),
+          email: res.user.email || userObj.email,
+          full_name: res.user.name || userObj.full_name,
+        };
+      }
+    } catch (err) {
+      console.warn("[Wallet Auth Error]", err);
     }
 
     if (typeof window !== "undefined") {
-      localStorage.setItem(
-        "df_wallet_user",
-        JSON.stringify({
-          address: payload.address.toLowerCase(),
-          email: `${payload.address.slice(0, 6)}…${payload.address.slice(-4)}@wallet.draftforge.app`,
-          full_name: `Wallet ${payload.address.slice(0, 6)}…${payload.address.slice(-4)}`,
-        }),
-      );
+      if (token) {
+        localStorage.setItem("df_auth_token", token);
+      }
+      localStorage.setItem("df_auth_user", JSON.stringify(userObj));
+      localStorage.setItem("df_wallet_user", JSON.stringify(userObj));
     }
 
     toast.success(
@@ -76,6 +83,7 @@ export function WalletAuthButtons({
     );
     navigate({ to: redirectTo });
   }
+
 
   async function signInWithMetaMask() {
     setBusy("metamask");

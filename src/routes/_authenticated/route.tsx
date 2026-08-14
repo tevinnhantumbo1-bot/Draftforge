@@ -1,17 +1,29 @@
 import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
-import { supabase } from "@/integrations/supabase/client";
 
 export const Route = createFileRoute("/_authenticated")({
   ssr: false,
   beforeLoad: async ({ location }) => {
-    const { data, error } = await supabase.auth.getUser();
-    if (data?.user) {
-      return { user: data.user };
-    }
-
-    // Fallback: check if local wallet authentication token or session is active
+    // Check if user has an active MongoDB session token or wallet authentication
     if (typeof window !== "undefined") {
+      const authToken = localStorage.getItem("df_auth_token");
+      const authUser = localStorage.getItem("df_auth_user");
       const walletUser = localStorage.getItem("df_wallet_user");
+
+      if (authToken && authUser) {
+        try {
+          const parsed = JSON.parse(authUser);
+          return {
+            user: {
+              id: parsed.id || parsed.email,
+              email: parsed.email,
+              user_metadata: { full_name: parsed.name || parsed.email.split("@")[0] },
+            },
+          };
+        } catch {
+          /* parse error fallback */
+        }
+      }
+
       if (walletUser) {
         try {
           const parsed = JSON.parse(walletUser);
@@ -32,3 +44,4 @@ export const Route = createFileRoute("/_authenticated")({
   },
   component: () => <Outlet />,
 });
+

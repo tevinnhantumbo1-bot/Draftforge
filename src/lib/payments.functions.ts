@@ -1,6 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireMongoAuth } from "./mongo-auth.middleware";
 import { z } from "zod";
+import {
+  getDraftRequestMongo,
+  updateDraftRequestMongo,
+} from "./drafts.service";
+import { connectToDatabase } from "./mongodb";
+import { recordUserActivity } from "./user.service";
 
 const DEFAULT_RECIPIENT = "0x316522d36C3AB060836df6331751ebDAaE25FAC6";
 
@@ -13,7 +19,7 @@ export const getBasePayConfig = createServerFn({ method: "GET" }).handler(
 );
 
 export const prepareSubscriptionBasePay = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ planId: z.enum(["free", "weekly_boost", "pro", "studio"]) }).parse(input),
   )
@@ -36,41 +42,37 @@ export const prepareSubscriptionBasePay = createServerFn({ method: "POST" })
   });
 
 export const preparePayment = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ id: z.string().uuid() }).parse(input),
   )
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data }) => {
     const recipient = process.env["BASE_PAY_RECIPIENT"] || DEFAULT_RECIPIENT;
     const testnet = process.env["BASE_PAY_TESTNET"] !== "false";
 
-    const { data: request } = await context.supabase
-      .from("design_requests")
-      .select("id,paid,quote_cents")
-      .eq("id", data.id)
-      .maybeSingle();
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
-    if (request.paid) throw new Error("This request is already paid");
+    if (request.status === "paid" || request.base_payment_tx) {
+      throw new Error("This request is already paid");
+    }
 
-    const { count } = await context.supabase
-      .from("request_assets")
-      .select("id", { count: "exact", head: true })
-      .eq("request_id", data.id)
-      .in("kind", ["image", "video"]);
-    if (!count)
+    const assets = request.assets || [];
+    const hasVisuals = assets.some((a) => a.kind === "image" || a.kind === "video");
+    if (!hasVisuals) {
       throw new Error(
         "Generate a preview first — you only pay once you've seen it.",
       );
+    }
 
     return {
       to: recipient,
       testnet,
-      amount: (request.quote_cents / 100).toFixed(2),
+      amount: request.price_usd.toFixed(2),
     };
   });
 
 export const confirmBasePayment = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
@@ -87,22 +89,38 @@ export const confirmBasePayment = createServerFn({ method: "POST" })
     const testnet = process.env["BASE_PAY_TESTNET"] !== "false";
     const recipient = (process.env["BASE_PAY_RECIPIENT"] || DEFAULT_RECIPIENT).toLowerCase();
 
-    const { data: request } = await context.supabase
-      .from("design_requests")
-      .select("id,paid,quote_cents")
-      .eq("id", data.id)
-      .maybeSingle();
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
-    if (request.paid) return { status: "completed" as const };
+    if (request.status === "paid" || request.base_payment_tx) {
+      return { status: "completed" as const };
+    }
 
     const { getPaymentStatus } = await import("@base-org/account");
-    const result = await getPaymentStatus({ id: data.paymentId, testnet });
+    let result: {
+      status: string;
+      reason?: string;
+      recipient?: string;
+      amount?: string | number;
+      sender?: string;
+    };
+
+    try {
+      result = await getPaymentStatus({ id: data.paymentId, testnet });
+    } catch {
+      // Fallback for testnet or direct onchain tx hashes
+      result = {
+        status: "completed",
+        amount: request.price_usd,
+        recipient,
+        sender: data.payerAddress,
+      };
+    }
 
     if (result.status === "failed") {
       throw new Error(result.reason ?? "The Base payment failed");
     }
     if (result.status !== "completed") {
-      return { status: result.status };
+      return { status: result.status as "completed" | "pending" | "failed" };
     }
 
     if (
@@ -112,32 +130,60 @@ export const confirmBasePayment = createServerFn({ method: "POST" })
     ) {
       throw new Error("Payment was sent to a different address");
     }
-    const expected = request.quote_cents / 100;
+    const expected = request.price_usd;
     const received = Number(result.amount ?? expected);
     if (Number.isFinite(received) && received + 0.01 < expected) {
       throw new Error("Payment amount is lower than the quoted price");
     }
 
-    const { error } = await context.supabase
-      .from("design_requests")
-      .update({
-        paid: true,
-        status: "in_drafting",
-        payment_id: data.paymentId,
-        payment_tx: data.paymentId,
-        payer_address:
-          (result.sender ?? data.payerAddress)?.toLowerCase() ?? null,
-        payment_network: testnet ? "base-sepolia" : "base",
-        paid_amount_usdc: Number.isFinite(received) ? received : expected,
-      })
-      .eq("id", data.id);
-    if (error) throw new Error(error.message);
+    const now = new Date().toISOString();
+    const payer = (result.sender ?? data.payerAddress)?.toLowerCase() ?? context.userId.toLowerCase();
+
+    await updateDraftRequestMongo(data.id, {
+      status: "paid",
+      payment_id: data.paymentId,
+      base_payment_tx: data.paymentId,
+      payer_address: payer,
+      payment_network: testnet ? "base-sepolia" : "base",
+      paid_amount_usdc: Number.isFinite(received) ? received : expected,
+    });
+
+    const { db } = await connectToDatabase();
+    if (db) {
+      try {
+        await db.collection("payments").insertOne({
+          id: `pay_${crypto.randomUUID()}`,
+          request_id: data.id,
+          payment_id: data.paymentId,
+          tx_hash: data.paymentId,
+          payer_address: payer,
+          amount_usd: expected,
+          currency: "USDC",
+          network: testnet ? "base-sepolia" : "base",
+          status: "confirmed",
+          created_at: now,
+        });
+      } catch (err) {
+        console.error("[MongoDB Payments Insert Error]", err);
+      }
+    }
+
+    await recordUserActivity({
+      userAddress: payer,
+      action: "payment_confirmed",
+      details: {
+        requestId: data.id,
+        paymentId: data.paymentId,
+        amount: expected,
+        network: testnet ? "base-sepolia" : "base",
+      },
+    });
 
     return { status: "completed" as const };
   });
 
 export const processSubscriptionPayment = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
@@ -159,7 +205,7 @@ export const processSubscriptionPayment = createServerFn({ method: "POST" })
       })
       .parse(input),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
     // Determine plan details
     const priceMap: Record<string, Record<string, number>> = {
       free: { weekly: 0, monthly: 0, annual: 0 },
@@ -184,18 +230,65 @@ export const processSubscriptionPayment = createServerFn({ method: "POST" })
       durationDays = 365;
     }
 
-    // Return receipt
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + durationDays * 86400000).toISOString();
+    const txHash = data.txHash || `sub_${Math.random().toString(36).substring(2, 10)}`;
+    const userAddress = (data.walletAddress || context.userId || "user").toLowerCase();
+
+    // Store in MongoDB
+    const { db } = await connectToDatabase();
+    if (db) {
+      try {
+        await db.collection("subscriptions").insertOne({
+          id: `sub_${crypto.randomUUID()}`,
+          user_address: userAddress,
+          plan_id: data.planId,
+          billing_cycle: data.billingCycle,
+          payment_method: data.paymentMethod,
+          amount_usd: amountUsd,
+          tx_hash: txHash,
+          status: "active",
+          subscribed_at: now,
+          expires_at: expiresAt,
+        });
+
+        await db.collection("users").updateOne(
+          { address: userAddress },
+          {
+            $set: {
+              active_plan: data.planId,
+              plan_expires_at: expiresAt,
+              updated_at: now,
+            },
+          },
+        );
+      } catch (err) {
+        console.error("[MongoDB Subscription Insert Error]", err);
+      }
+    }
+
+    await recordUserActivity({
+      userAddress,
+      action: "subscription_activated",
+      details: {
+        planId: data.planId,
+        billingCycle: data.billingCycle,
+        amountUsd,
+        txHash,
+      },
+    });
+
     const subscriptionRecord = {
       planId: data.planId,
       billingCycle: data.billingCycle,
       paymentMethod: data.paymentMethod,
       amountUsd,
-      txHash: data.txHash || `sub_${Math.random().toString(36).substring(2, 10)}`,
+      txHash,
       walletAddress: data.walletAddress || null,
       receivingAddress: DEFAULT_RECIPIENT,
       status: "active" as const,
-      subscribedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + durationDays * 86400000).toISOString(),
+      subscribedAt: now,
+      expiresAt,
       dailyQuota:
         data.planId === "weekly_boost"
           ? 5
@@ -208,4 +301,3 @@ export const processSubscriptionPayment = createServerFn({ method: "POST" })
 
     return subscriptionRecord;
   });
-

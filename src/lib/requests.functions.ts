@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireMongoAuth } from "./mongo-auth.middleware";
 import { z } from "zod";
 import {
   createDraftRequestMongo,
@@ -7,22 +7,15 @@ import {
   listDraftRequestsMongo,
   updateDraftRequestMongo,
   deleteDraftRequestMongo,
+  addAssetToDraftMongo,
   getDashboardStatsMongo,
   type DraftRequestDoc,
+  type DraftAsset,
 } from "./drafts.service";
-import {
-  generateLegalContractDraft,
-  analyzeLegalRisk,
-  chatWithAiAssistant,
-  expandClauseWithAi,
-  summarizeLegalDocWithAi,
-} from "./gemini";
 import { recordUserActivity } from "./user.service";
 
-const BUCKET = "design-previews";
-
 export const getDailyFreeUsage = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ activePlan: z.string().optional() }).optional().parse(input),
   )
@@ -68,7 +61,7 @@ const CreateInput = z.object({
 });
 
 export const createRequest = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) => CreateInput.parse(input))
   .handler(async ({ data, context }) => {
     const { quoteCents } = await import("@/lib/pricing");
@@ -97,13 +90,18 @@ export const createRequest = createServerFn({ method: "POST" })
     const doc: DraftRequestDoc = {
       id: requestId,
       title: data.title,
-      document_type: data.category || "Legal Contract",
+      document_type: data.category || "CAD Design Brief",
       category: data.category,
       jurisdiction: data.jurisdiction || "US-CA",
       urgency: data.urgency || "standard",
       description: data.brief,
+      dimensions: data.dimensions ?? null,
+      units: data.units,
+      style: data.style ?? null,
+      package: data.package,
       key_terms: data.keyTerms || [],
       attached_files: [],
+      assets: [],
       status: isFreeTest ? "submitted" : "draft",
       price_usd: quote / 100,
       user_address: context.userId.toLowerCase(),
@@ -112,25 +110,6 @@ export const createRequest = createServerFn({ method: "POST" })
     };
 
     await createDraftRequestMongo(doc);
-
-    // Also write to Supabase for backward compatibility if configured
-    try {
-      await context.supabase.from("design_requests").insert({
-        id: requestId,
-        user_id: context.userId,
-        title: data.title,
-        brief: data.brief,
-        category: data.category,
-        dimensions: data.dimensions ?? null,
-        units: data.units,
-        style: data.style ?? null,
-        package: data.package,
-        status: isFreeTest ? "free_test" : "submitted",
-        quote_cents: quote,
-      });
-    } catch {
-      /* fallback mode */
-    }
 
     return {
       id: requestId,
@@ -142,35 +121,20 @@ export const createRequest = createServerFn({ method: "POST" })
   });
 
 export const listMyRequests = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .handler(async ({ context }) => {
     const mongoRequests = await listDraftRequestsMongo(context.userId);
-    if (mongoRequests && mongoRequests.length > 0) {
-      return mongoRequests.map((r) => ({
-        id: r.id,
-        title: r.title,
-        category: r.category || r.document_type,
-        status: r.status,
-        quote_cents: Math.round(r.price_usd * 100),
-        paid: r.status === "paid" || !!r.base_payment_tx,
-        created_at: r.created_at,
-        package: "standard",
-      }));
-    }
-
-    try {
-      const { data, error } = await context.supabase
-        .from("design_requests")
-        .select("id,title,category,status,quote_cents,paid,created_at,package")
-        .order("created_at", { ascending: false });
-      if (!error && data) return data;
-    } catch {
-      /* fallback */
-    }
-
-    return [];
+    return mongoRequests.map((r) => ({
+      id: r.id,
+      title: r.title,
+      category: r.category || r.document_type,
+      status: r.status,
+      quote_cents: Math.round(r.price_usd * 100),
+      paid: r.status === "paid" || !!r.base_payment_tx,
+      created_at: r.created_at,
+      package: r.package || "standard",
+    }));
   });
-
 
 const UploadInput = z.object({
   id: z.string().uuid(),
@@ -186,170 +150,110 @@ const UploadInput = z.object({
 });
 
 export const uploadReferenceImages = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) => UploadInput.parse(input))
-  .handler(async ({ data, context }) => {
-    const { data: request } = await context.supabase
-      .from("design_requests")
-      .select("id")
-      .eq("id", data.id)
-      .maybeSingle();
+  .handler(async ({ data }) => {
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
 
-    const cad = await import("@/lib/cad.server");
-    const { supabaseAdmin } =
-      await import("@/integrations/supabase/client.server");
-
     for (const file of data.files) {
-      const { bytes, contentType } = cad.dataUrlToBytes(file.dataUrl);
-      const ext = contentType.includes("jpeg")
-        ? "jpg"
-        : contentType.includes("webp")
-          ? "webp"
-          : "png";
-      const path = `${context.userId}/${data.id}/ref-${crypto.randomUUID()}.${ext}`;
-      const up = await supabaseAdmin.storage
-        .from(BUCKET)
-        .upload(path, bytes, { contentType });
-      if (up.error) throw new Error(up.error.message);
-      await supabaseAdmin.from("request_assets").insert({
-        request_id: data.id,
-        user_id: context.userId,
+      const asset: DraftAsset = {
+        id: crypto.randomUUID(),
         kind: "reference",
-        url: path,
+        url: file.dataUrl,
         prompt: file.name,
-      });
+        created_at: new Date().toISOString(),
+      };
+      await addAssetToDraftMongo(data.id, asset);
     }
     return { count: data.files.length };
   });
 
 export const payForRequest = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ id: z.string().uuid() }).parse(input),
   )
-  .handler(async ({ data, context }) => {
-    const { data: request } = await context.supabase
-      .from("design_requests")
-      .select("id,paid")
-      .eq("id", data.id)
-      .maybeSingle();
+  .handler(async ({ data }) => {
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
-    if (request.paid) return { paid: true };
+    if (request.status === "paid" || request.base_payment_tx) return { paid: true };
 
-    const { count } = await context.supabase
-      .from("request_assets")
-      .select("id", { count: "exact", head: true })
-      .eq("request_id", data.id)
-      .in("kind", ["image", "video"]);
-    if (!count)
+    const assets = request.assets || [];
+    const hasVisuals = assets.some((a) => a.kind === "image" || a.kind === "video");
+    if (!hasVisuals) {
       throw new Error(
         "Generate a preview first — you only pay once you've seen it.",
       );
+    }
 
-    const { error } = await context.supabase
-      .from("design_requests")
-      .update({ paid: true, status: "in_drafting" })
-      .eq("id", data.id);
-    if (error) throw new Error(error.message);
+    await updateDraftRequestMongo(data.id, {
+      status: "drafting",
+    });
+
     return { paid: true };
   });
 
 export const getRequest = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ id: z.string().uuid() }).parse(input),
   )
-  .handler(async ({ data, context }) => {
+  .handler(async ({ data }) => {
     const mongoReq = await getDraftRequestMongo(data.id);
-    if (mongoReq) {
-      return {
-        request: {
-          id: mongoReq.id,
-          title: mongoReq.title,
-          brief: mongoReq.description,
-          category: mongoReq.category || mongoReq.document_type,
-          status: mongoReq.status,
-          quote_cents: Math.round(mongoReq.price_usd * 100),
-          paid: mongoReq.status === "paid" || !!mongoReq.base_payment_tx,
-          created_at: mongoReq.created_at,
-          draft_output: mongoReq.draft_output,
-          ai_analysis: mongoReq.ai_analysis,
-          jurisdiction: mongoReq.jurisdiction,
-        },
-        assets: [],
-      };
-    }
+    if (!mongoReq) throw new Error("Request not found");
 
-    const { data: request, error } = await context.supabase
-      .from("design_requests")
-      .select("*")
-      .eq("id", data.id)
-      .maybeSingle();
-    if (error) throw new Error(error.message);
-    if (!request) throw new Error("Request not found");
+    const assets = (mongoReq.assets || []).map((a) => ({
+      ...a,
+      signedUrl: a.url, // Data URL or cloud URL
+    }));
 
-    const { data: assets } = await context.supabase
-      .from("request_assets")
-      .select("id,kind,url,prompt,created_at")
-      .eq("request_id", data.id)
-      .order("created_at", { ascending: true });
-
-    const { supabaseAdmin } =
-      await import("@/integrations/supabase/client.server");
-    const withUrls = await Promise.all(
-      (assets ?? []).map(async (a) => {
-        const signed = await supabaseAdmin.storage
-          .from(BUCKET)
-          .createSignedUrl(a.url, 3600);
-        return { ...a, signedUrl: signed.data?.signedUrl ?? null };
-      }),
-    );
-    return { request, assets: withUrls };
+    return {
+      request: {
+        id: mongoReq.id,
+        title: mongoReq.title,
+        brief: mongoReq.description,
+        category: mongoReq.category || mongoReq.document_type,
+        dimensions: mongoReq.dimensions,
+        units: mongoReq.units,
+        style: mongoReq.style,
+        status: mongoReq.status,
+        quote_cents: Math.round(mongoReq.price_usd * 100),
+        paid: mongoReq.status === "paid" || !!mongoReq.base_payment_tx,
+        created_at: mongoReq.created_at,
+        draft_output: mongoReq.draft_output,
+        ai_analysis: mongoReq.ai_analysis,
+        jurisdiction: mongoReq.jurisdiction,
+        package: mongoReq.package || "standard",
+      },
+      assets,
+    };
   });
 
-
 export const generatePreviewImages = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ id: z.string().uuid() }).parse(input),
   )
-  .handler(async ({ data, context }) => {
-    const { data: request, error } = await context.supabase
-      .from("design_requests")
-      .select("*")
-      .eq("id", data.id)
-      .maybeSingle();
-    if (error) throw new Error(error.message);
+  .handler(async ({ data }) => {
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
 
     const cad = await import("@/lib/cad.server");
-    const { supabaseAdmin } =
-      await import("@/integrations/supabase/client.server");
 
-    const { data: refs } = await context.supabase
-      .from("request_assets")
-      .select("url")
-      .eq("request_id", request.id)
-      .eq("kind", "reference");
-    const referenceUrls: string[] = [];
-    for (const r of refs ?? []) {
-      const signed = await supabaseAdmin.storage
-        .from(BUCKET)
-        .createSignedUrl(r.url, 3600);
-      if (signed.data?.signedUrl) referenceUrls.push(signed.data.signedUrl);
-    }
+    const refs = (request.assets || []).filter((a) => a.kind === "reference");
+    const referenceUrls = refs.map((r) => r.url);
 
     const brief = {
       title: request.title,
-      brief: request.brief,
-      category: request.category,
+      brief: request.description,
+      category: request.category || request.document_type,
       dimensions: request.dimensions,
       units: request.units,
       style: request.style,
     };
 
-    const created: string[] = [];
+    let count = 0;
     for (const variant of cad.IMAGE_VARIANTS) {
       const prompt = cad.imagePrompt(brief, variant);
       const dataUrl = await cad.generateImage(
@@ -358,51 +262,41 @@ export const generatePreviewImages = createServerFn({ method: "POST" })
           : prompt,
         referenceUrls,
       );
-      const { bytes, contentType } = cad.dataUrlToBytes(dataUrl);
-      const ext = contentType.includes("jpeg") ? "jpg" : "png";
-      const path = `${context.userId}/${request.id}/${crypto.randomUUID()}.${ext}`;
-      const up = await supabaseAdmin.storage
-        .from(BUCKET)
-        .upload(path, bytes, { contentType });
-      if (up.error) throw new Error(up.error.message);
-      await supabaseAdmin.from("request_assets").insert({
-        request_id: request.id,
-        user_id: context.userId,
+
+      const asset: DraftAsset = {
+        id: crypto.randomUUID(),
         kind: "image",
-        url: path,
+        url: dataUrl,
         prompt,
-      });
-      created.push(path);
+        created_at: new Date().toISOString(),
+      };
+
+      await addAssetToDraftMongo(request.id, asset);
+      count++;
     }
 
-    await supabaseAdmin
-      .from("design_requests")
-      .update({ status: "preview_ready" })
-      .eq("id", request.id);
+    await updateDraftRequestMongo(request.id, {
+      status: "review_ready",
+    });
 
-    return { count: created.length };
+    return { count };
   });
 
 export const startPreviewVideo = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z.object({ id: z.string().uuid() }).parse(input),
   )
-  .handler(async ({ data, context }) => {
-    const { data: request, error } = await context.supabase
-      .from("design_requests")
-      .select("*")
-      .eq("id", data.id)
-      .maybeSingle();
-    if (error) throw new Error(error.message);
+  .handler(async ({ data }) => {
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
 
     const cad = await import("@/lib/cad.server");
     const jobId = await cad.createVideoJob(
       cad.videoPrompt({
         title: request.title,
-        brief: request.brief,
-        category: request.category,
+        brief: request.description,
+        category: request.category || request.document_type,
         dimensions: request.dimensions,
         units: request.units,
         style: request.style,
@@ -412,18 +306,14 @@ export const startPreviewVideo = createServerFn({ method: "POST" })
   });
 
 export const pollPreviewVideo = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireMongoAuth])
   .inputValidator((input: unknown) =>
     z
       .object({ id: z.string().uuid(), jobId: z.string().min(3).max(200) })
       .parse(input),
   )
-  .handler(async ({ data, context }) => {
-    const { data: request } = await context.supabase
-      .from("design_requests")
-      .select("id,user_id")
-      .eq("id", data.id)
-      .maybeSingle();
+  .handler(async ({ data }) => {
+    const request = await getDraftRequestMongo(data.id);
     if (!request) throw new Error("Request not found");
 
     const cad = await import("@/lib/cad.server");
@@ -437,27 +327,26 @@ export const pollPreviewVideo = createServerFn({ method: "POST" })
       return { status: job.status, progress: job.progress ?? 0 };
     }
 
-    const { supabaseAdmin } =
-      await import("@/integrations/supabase/client.server");
-    const path = `${context.userId}/${request.id}/${data.jobId}.mp4`;
-    const { data: existing } = await supabaseAdmin
-      .from("request_assets")
-      .select("id")
-      .eq("request_id", request.id)
-      .eq("url", path)
-      .maybeSingle();
-    if (!existing) {
-      const mp4 = await cad.downloadVideo(data.jobId);
-      const up = await supabaseAdmin.storage
-        .from(BUCKET)
-        .upload(path, mp4, { contentType: "video/mp4", upsert: true });
-      if (up.error) throw new Error(up.error.message);
-      await supabaseAdmin.from("request_assets").insert({
-        request_id: request.id,
-        user_id: context.userId,
-        kind: "video",
-        url: path,
-      });
-    }
+    const videoBuffer = await cad.downloadVideo(data.jobId);
+    const b64 = Buffer.from(videoBuffer).toString("base64");
+    const dataUrl = `data:video/mp4;base64,${b64}`;
+
+    const asset: DraftAsset = {
+      id: crypto.randomUUID(),
+      kind: "video",
+      url: dataUrl,
+      prompt: `Motion orbit animation for ${request.title}`,
+      created_at: new Date().toISOString(),
+    };
+
+    await addAssetToDraftMongo(request.id, asset);
+
     return { status: "completed", progress: 100 };
+  });
+
+export const getDashboardSummary = createServerFn({ method: "GET" })
+  .middleware([requireMongoAuth])
+  .handler(async ({ context }) => {
+    const stats = await getDashboardStatsMongo(context.userId);
+    return stats;
   });

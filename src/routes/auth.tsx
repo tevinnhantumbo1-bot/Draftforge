@@ -2,24 +2,24 @@ import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { z } from "zod";
 import { toast } from "sonner";
-import { Ruler } from "lucide-react";
-import { supabase } from "@/integrations/supabase/client";
-import { lovable } from "@/integrations/lovable/index";
+import { Ruler, ShieldCheck } from "lucide-react";
+import { useServerFn } from "@tanstack/react-start";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { WalletAuthButtons } from "@/components/wallet-auth";
+import { signUpWithEmail, signInWithEmail } from "@/lib/auth.functions";
 
 export const Route = createFileRoute("/auth")({
   head: () => ({
     meta: [
-      { title: "Sign in — DraftForge" },
+      { title: "Sign in — DraftForge AI" },
       {
         name: "description",
         content:
-          "Sign in to submit AutoCAD design requests and track previews.",
+          "Sign in to submit AutoCAD design requests and track previews with MongoDB backend.",
       },
-      { property: "og:title", content: "Sign in — DraftForge" },
+      { property: "og:title", content: "Sign in — DraftForge AI" },
       {
         property: "og:description",
         content: "Access your DraftForge design requests and previews.",
@@ -44,12 +44,19 @@ function AuthPage() {
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sent, setSent] = useState(false);
+
+  const signUpFn = useServerFn(signUpWithEmail);
+  const signInFn = useServerFn(signInWithEmail);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session) navigate({ to: safePath(redirect) });
-    });
+    // Check if user is already authenticated via MongoDB session token or wallet
+    if (typeof window !== "undefined") {
+      const token = localStorage.getItem("df_auth_token");
+      const walletUser = localStorage.getItem("df_wallet_user");
+      if (token || walletUser) {
+        navigate({ to: safePath(redirect) });
+      }
+    }
   }, [navigate, redirect]);
 
   async function submit(e: React.FormEvent) {
@@ -57,47 +64,42 @@ function AuthPage() {
     setBusy(true);
     try {
       if (mode === "signup") {
-        const { data, error } = await supabase.auth.signUp({
-          email,
-          password,
-          options: {
-            emailRedirectTo: window.location.origin + safePath(redirect),
-            data: { full_name: name },
+        const res = await signUpFn({
+          data: {
+            email,
+            password,
+            name: name || undefined,
+            userAgent: typeof navigator !== "undefined" ? navigator.userAgent : undefined,
           },
         });
-        if (error) throw error;
-        if (!data.session) {
-          setSent(true);
-          return;
+
+        if (res?.token) {
+          localStorage.setItem("df_auth_token", res.token);
+          localStorage.setItem("df_auth_user", JSON.stringify(res.user));
+          toast.success("Account created successfully!");
+          navigate({ to: safePath(redirect) });
         }
       } else {
-        const { error } = await supabase.auth.signInWithPassword({
-          email,
-          password,
+        const res = await signInFn({
+          data: {
+            email,
+            password,
+            userAgent: typeof navigator !== "undefined" ? navigator.userAgent : undefined,
+          },
         });
-        if (error) throw error;
+
+        if (res?.token) {
+          localStorage.setItem("df_auth_token", res.token);
+          localStorage.setItem("df_auth_user", JSON.stringify(res.user));
+          toast.success("Signed in successfully!");
+          navigate({ to: safePath(redirect) });
+        }
       }
-      navigate({ to: safePath(redirect) });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Something went wrong");
+      toast.error(err instanceof Error ? err.message : "Authentication failed");
     } finally {
       setBusy(false);
     }
-  }
-
-  async function google() {
-    const result = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri:
-        window.location.origin +
-        "/auth?redirect=" +
-        encodeURIComponent(safePath(redirect)),
-    });
-    if (result.error) {
-      toast.error("Google sign-in failed. Try again.");
-      return;
-    }
-    if (result.redirected) return;
-    navigate({ to: safePath(redirect) });
   }
 
   return (
@@ -110,107 +112,96 @@ function AuthPage() {
           <span className="font-display text-lg font-semibold">DraftForge</span>
         </Link>
 
-        {sent ? (
-          <div className="mt-8">
-            <h1 className="text-2xl font-semibold">Check your email</h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              We sent a confirmation link to {email}. Click it to activate your
-              account.
-            </p>
-          </div>
-        ) : (
-          <>
-            <h1 className="mt-8 text-2xl font-semibold">
-              {mode === "signin" ? "Sign in" : "Create your account"}
-            </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Track your design requests, previews and drawings.
-            </p>
+        <h1 className="mt-8 text-2xl font-semibold">
+          {mode === "signin" ? "Sign in" : "Create your account"}
+        </h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Connected to secure MongoDB database cluster.
+        </p>
 
-            <Button
-              variant="outline"
-              className="mt-6 w-full"
-              onClick={google}
-              type="button"
-            >
-              Continue with Google
-            </Button>
+        <div className="mt-6">
+          <WalletAuthButtons
+            redirectTo={safePath(redirect)}
+            layout="stack"
+          />
+        </div>
 
-            <div className="mt-3">
-              <WalletAuthButtons
-                redirectTo={safePath(redirect)}
-                layout="stack"
+        <div className="my-6 flex items-center gap-3">
+          <span className="h-px flex-1 bg-border" />
+          <span className="tech-label text-muted-foreground">or email</span>
+          <span className="h-px flex-1 bg-border" />
+        </div>
+
+        <form className="space-y-4" onSubmit={submit}>
+          {mode === "signup" && (
+            <div className="space-y-2">
+              <Label htmlFor="name">Full name</Label>
+              <Input
+                id="name"
+                value={name}
+                maxLength={100}
+                placeholder="Alex Morgan"
+                onChange={(e) => setName(e.target.value)}
+                required
               />
             </div>
+          )}
+          <div className="space-y-2">
+            <Label htmlFor="email">Email</Label>
+            <Input
+              id="email"
+              type="email"
+              placeholder="alex@company.com"
+              value={email}
+              maxLength={255}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="password">Password</Label>
+            <Input
+              id="password"
+              type="password"
+              placeholder="••••••••"
+              value={password}
+              minLength={6}
+              maxLength={72}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+          </div>
+          <Button
+            variant="hero"
+            className="w-full"
+            disabled={busy}
+            type="submit"
+          >
+            {busy
+              ? "Authenticating…"
+              : mode === "signin"
+                ? "Sign in"
+                : "Create account"}
+          </Button>
+        </form>
 
-            <div className="my-6 flex items-center gap-3">
-              <span className="h-px flex-1 bg-border" />
-              <span className="tech-label text-muted-foreground">or</span>
-              <span className="h-px flex-1 bg-border" />
-            </div>
-
-            <form className="space-y-4" onSubmit={submit}>
-              {mode === "signup" && (
-                <div className="space-y-2">
-                  <Label htmlFor="name">Full name</Label>
-                  <Input
-                    id="name"
-                    value={name}
-                    maxLength={100}
-                    onChange={(e) => setName(e.target.value)}
-                    required
-                  />
-                </div>
-              )}
-              <div className="space-y-2">
-                <Label htmlFor="email">Email</Label>
-                <Input
-                  id="email"
-                  type="email"
-                  value={email}
-                  maxLength={255}
-                  onChange={(e) => setEmail(e.target.value)}
-                  required
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="password">Password</Label>
-                <Input
-                  id="password"
-                  type="password"
-                  value={password}
-                  minLength={6}
-                  maxLength={72}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                />
-              </div>
-              <Button
-                variant="hero"
-                className="w-full"
-                disabled={busy}
-                type="submit"
-              >
-                {busy
-                  ? "Working…"
-                  : mode === "signin"
-                    ? "Sign in"
-                    : "Create account"}
-              </Button>
-            </form>
-
-            <button
-              type="button"
-              className="mt-5 w-full text-sm text-muted-foreground hover:text-foreground"
-              onClick={() => setMode(mode === "signin" ? "signup" : "signin")}
-            >
-              {mode === "signin"
-                ? "No account? Create one"
-                : "Already have an account? Sign in"}
-            </button>
-          </>
-        )}
+        <div className="mt-6 flex items-center justify-between text-xs text-muted-foreground">
+          <span className="flex items-center gap-1.5 text-emerald-400">
+            <ShieldCheck className="size-3.5" />
+            MongoDB Auth Active
+          </span>
+          <button
+            type="button"
+            className="hover:text-foreground underline underline-offset-2"
+            onClick={() => setMode(mode === "signin" ? "signup" : "signin")}
+          >
+            {mode === "signin"
+              ? "No account? Create one"
+              : "Already have an account? Sign in"}
+          </button>
+        </div>
       </div>
     </div>
   );
 }
+
